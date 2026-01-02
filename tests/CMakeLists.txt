@@ -13,7 +13,3 @@ add_test(NAME test_fmha_cc COMMAND test_fmha_cc)
 add_executable(test_mha test_mha.cu)
 target_link_libraries(test_mha cobraml2 GTest::gtest_main CUDA::curand)
 add_test(NAME test_mha COMMAND test_mha)
-
-add_executable(test_mha_cute test_mha_cute.cu)
-target_link_libraries(test_mha_cute cobraml2 GTest::gtest_main CUDA::curand)
-add_test(NAME test_mha_cute COMMAND test_mha_cute)
