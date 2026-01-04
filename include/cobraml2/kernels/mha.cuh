@@ -18,7 +18,6 @@
 #pragma once
 #include <cute/tensor.hpp>
 #include <cute/layout.hpp>
-#include <cmath>
 
 namespace cobraml::kernels{
 
@@ -44,20 +43,20 @@ auto make_gemm_tiled_mma() {
 }
 
 namespace mha_cute{
-    template<int TILE_N, int TILE_D, typename DType, typename TiledCopyQ, typename TiledCopyK, typename TiledMMA>
+    template<int TILE_N, int HEAD_DIM, typename DType, typename TiledCopyQ, typename TiledCopyK, typename TiledMMA>
     __global__ void qk_kernel(
         const DType * __restrict__ Q, // [B, H, N, d]
         const DType * __restrict__ K, // [B, H, N, d]
         DType* __restrict__ S, // [B, H, N, N]
-        int B, int H, int N, int d,
+        int B, int H, int N,
         TiledCopyQ tiled_copy_q,
         TiledCopyK tiled_copy_k,
         TiledMMA tiled_mma
     ){
-        // Create global memory tensor views with proper strides
-        auto Q_tensor = make_tensor(make_gmem_ptr(Q), make_layout(make_shape(B, H, N, d), make_stride(H*N*d, N*d, d, 1)));
-        auto K_tensor = make_tensor(make_gmem_ptr(K), make_layout(make_shape(B, H, N, d), make_stride(H*N*d, N*d, d, 1)));
-        auto S_tensor = make_tensor(make_gmem_ptr(S), make_layout(make_shape(B, H, N, N), make_stride(H*N*N, N*N, N, 1)));
+        // Create global memory tensor 
+        auto Q_tensor = make_tensor(make_gmem_ptr(Q), make_layout(make_shape(B, H, N, Int<HEAD_DIM>{}), LayoutRight{}));
+        auto K_tensor = make_tensor(make_gmem_ptr(K), make_layout(make_shape(B, H, N, Int<HEAD_DIM>{}), LayoutRight{}));
+        auto S_tensor = make_tensor(make_gmem_ptr(S), make_layout(make_shape(B, H, N, N), LayoutRight{}));
 
         // Decode batch and head indices from blockIdx.z
         int bh = blockIdx.z;
@@ -65,61 +64,53 @@ namespace mha_cute{
         int h_idx = bh % H;
 
         // Slice tensors to current batch and head
-        auto Q_bh = Q_tensor(b_idx, h_idx, _, _); // [N, d]
-        auto K_bh = K_tensor(b_idx, h_idx, _, _); // [N, d]
+        auto Q_bh = Q_tensor(b_idx, h_idx, _, _); // [N, HEAD_DIM]
+        auto K_bh = K_tensor(b_idx, h_idx, _, _); // [N, HEAD_DIM]
         auto S_bh = S_tensor(b_idx, h_idx, _, _); // [N, N]
 
-        // CTA tile coordinates
+        // cta tile coordinates
         int tile_row = blockIdx.y;
         int tile_col = blockIdx.x;
 
-        // Extract this CTA's tile of Q, K, and S
+        // extract this CTA's tiles
         auto gQ = local_tile(Q_bh,
-            make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
-            make_coord(tile_row, 0),
-            Step<_1, _1>{}
+            make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
+            make_coord(tile_row, 0)
         );
 
         auto gK = local_tile(K_bh,
-            make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
-            make_coord(tile_col, 0),
-            Step<_1, _1>{}
+            make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
+            make_coord(tile_col, 0)
         );
 
         auto gS = local_tile(S_bh,
             make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
-            make_coord(tile_row, tile_col),
-            Step<_1, _1>{}
+            make_coord(tile_row, tile_col)
         );
         
-        // Shared memory layouts
-        auto sQ_layout = make_layout(make_shape(Int<TILE_N>{}, Int<TILE_D>{}), make_stride(Int<TILE_D>{}, _1{}));
-        // sK_load: row-major [TILE_N, TILE_D] for loading K from global memory
-        auto sK_load_layout = make_layout(make_shape(Int<TILE_N>{}, Int<TILE_D>{}), make_stride(Int<TILE_D>{}, _1{}));
-        auto sK_mma_layout = make_layout(make_shape(Int<TILE_D>{}, Int<TILE_N>{}), make_stride(_1{}, Int<TILE_D>{}));
+        // shared memory layouts
+        auto sQ_layout = make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
+        auto sK_layout = make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
 
         __shared__ DType smem_q[cosize_v<decltype(sQ_layout)>];
-        __shared__ DType smem_k[cosize_v<decltype(sK_load_layout)>];
+        __shared__ DType smem_k[cosize_v<decltype(sK_layout)>];
         
-        // Create shared memory tensor views
+        // create shared memory tensor views
         Tensor sQ = make_tensor(make_smem_ptr(smem_q), sQ_layout);
-        Tensor sK_load = make_tensor(make_smem_ptr(smem_k), sK_load_layout);
-        Tensor sK = make_tensor(make_smem_ptr(smem_k), sK_mma_layout);
+        Tensor sK = make_tensor(make_smem_ptr(smem_k), sK_layout);
 
-        // Thread partitioning for copy operations
-        ThrCopy thr_copy_q = tiled_copy_q.get_slice(threadIdx.x);
-        ThrCopy thr_copy_k = tiled_copy_k.get_slice(threadIdx.x);
+        // thread partitioning for copy operations
+        auto thr_copy_q = tiled_copy_q.get_slice(threadIdx.x);
+        auto thr_copy_k = tiled_copy_k.get_slice(threadIdx.x);
 
-        // partition source (global) tensors for this thread
+        // partition source (global) and destination (shared) tensors
         Tensor tQgQ = thr_copy_q.partition_S(gQ);
-        Tensor tKgK = thr_copy_k.partition_S(gK);
-        
-        // partition destination (shared) tensors for this thread
         Tensor tQsQ = thr_copy_q.partition_D(sQ);
-        Tensor tKsK = thr_copy_k.partition_D(sK_load);
+        Tensor tKgK = thr_copy_k.partition_S(gK);
+        Tensor tKsK = thr_copy_k.partition_D(sK);
 
         // thread partitioning for mma operations
-        ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
+        auto thr_mma = tiled_mma.get_slice(threadIdx.x);
 
         // partition shared memory for mma consumption
         Tensor tCsQ = thr_mma.partition_A(sQ);
@@ -130,47 +121,21 @@ namespace mha_cute{
         Tensor tCrS = thr_mma.make_fragment_C(tCgS);
         clear(tCrS);
 
-        // k-dimension loop: accumulate partial products
-        int num_k_tiles = (d + TILE_D - 1) / TILE_D;
+        // load Q and K tiles to shared memory
+        copy(tiled_copy_q, tQgQ, tQsQ);
+        copy(tiled_copy_k, tKgK, tKsK);
+        __syncthreads();
 
-        for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
-            int k_tile_idx = k_tile;
-            
-            // get q tile for this k iteration
-            auto gQ_k = local_tile(Q_bh,
-                make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
-                make_coord(tile_row, k_tile_idx),
-                Step<_1, _1>{}
-            );
-            
-            // get k tile for this k iteration
-            auto gK_k = local_tile(K_bh,
-                make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
-                make_coord(tile_col, k_tile_idx),
-                Step<_1, _1>{}
-            );
-            
-            // partition for this iteration
-            Tensor tQgQ_k = thr_copy_q.partition_S(gQ_k);
-            Tensor tKgK_k = thr_copy_k.partition_S(gK_k);
-
-            // load q and k tiles to shared memory
-            copy(tiled_copy_q, tQgQ_k, tQsQ);
-            copy(tiled_copy_k, tKgK_k, tKsK);
-
-            __syncthreads();
-
-            // compute partial gemm: accumulate Q @ K^T
-            gemm(tiled_mma, tCsQ, tCsK, tCrS);
-
-            __syncthreads();
-        }
+        // compute gemm: S = Q @ K^T
+        gemm(tiled_mma, tCsQ, tCsK, tCrS);
 
         // apply scaling factor 1/sqrt(d) and write to global memory
-        DType scale = DType(1.0) / sqrt(DType(d));
+        DType scale = DType(1.0) / sqrt(DType(HEAD_DIM));
+        CUTE_UNROLL
         for (int i = 0; i < size(tCrS); ++i) {
-            tCrS[i] *= scale;
+            tCrS(i) *= scale;
         }
+        
         copy(tCrS, tCgS);
     }
 
@@ -192,8 +157,8 @@ namespace mha_cute{
         int i = rem % N;
 
         // create tensor views
-        auto S_tensor = make_tensor(make_gmem_ptr(S), make_layout(make_shape(B, H, N, N), make_stride(H*N*N, N*N, N, 1)));
-        auto P_tensor = make_tensor(make_gmem_ptr(P), make_layout(make_shape(B, H, N, N), make_stride(H*N*N, N*N, N, 1)));
+        auto S_tensor = make_tensor(make_gmem_ptr(S), make_layout(make_shape(B, H, N, N), LayoutRight{}));
+        auto P_tensor = make_tensor(make_gmem_ptr(P), make_layout(make_shape(B, H, N, N), LayoutRight{}));
 
         // get this row
         auto S_row = S_tensor(b, h, i, _);
@@ -256,9 +221,9 @@ namespace mha_cute{
         TiledMMA tiled_mma
     ){
         // create global memory tensor views
-        auto P_tensor = make_tensor(make_gmem_ptr(P), make_layout(make_shape(B, H, N, N), make_stride(H*N*N, N*N, N, 1)));
-        auto V_tensor = make_tensor(make_gmem_ptr(V), make_layout(make_shape(B, H, N, d), make_stride(H*N*d, N*d, d, 1)));
-        auto O_tensor = make_tensor(make_gmem_ptr(O), make_layout(make_shape(B, H, N, d), make_stride(H*N*d, N*d, d, 1)));
+        auto P_tensor = make_tensor(make_gmem_ptr(P), make_layout(make_shape(B, H, N, N), LayoutRight{}));
+        auto V_tensor = make_tensor(make_gmem_ptr(V), make_layout(make_shape(B, H, N, d), LayoutRight{}));
+        auto O_tensor = make_tensor(make_gmem_ptr(O), make_layout(make_shape(B, H, N, d), LayoutRight{}));
 
         // decode batch and head indices
         int bh = blockIdx.z;
@@ -275,8 +240,8 @@ namespace mha_cute{
         int tile_col = blockIdx.x;
 
         // shared memory layouts
-        auto sP_layout = make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), make_stride(Int<TILE_N>{}, _1{}));
-        auto sV_layout = make_layout(make_shape(Int<TILE_N>{}, Int<TILE_D>{}), make_stride(Int<TILE_D>{}, _1{}));
+        auto sP_layout = make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), LayoutRight{}));
+        auto sV_layout = make_layout(make_shape(Int<TILE_N>{}, Int<TILE_D>{}), LayoutRight{}));
 
         __shared__ DType smem_p[cosize_v<decltype(sP_layout)>];
         __shared__ DType smem_v[cosize_v<decltype(sV_layout)>];
@@ -298,7 +263,6 @@ namespace mha_cute{
         auto gO = local_tile(O_bh,
             make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
             make_coord(tile_row, tile_col),
-            Step<_1, _1>{}
         );
         
         Tensor tCgO = thr_mma.partition_C(gO);
@@ -311,14 +275,12 @@ namespace mha_cute{
             auto gP = local_tile(P_bh,
                 make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
                 make_coord(tile_row, j_tile),
-                Step<_1, _1>{}
             );
             
             // get V tile: [TILE_N, TILE_D]
             auto gV = local_tile(V_bh,
                 make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
                 make_coord(j_tile, tile_col),
-                Step<_1, _1>{}
             );
             
             // Partition for copy
