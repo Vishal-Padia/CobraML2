@@ -1,14 +1,14 @@
 // kernel 1 (QK^T):
-    // Grid: (ceil(N/TILE), ceil(N/TILE), B*H)
-    // Block: (TILE, TILE)
+// Grid: (ceil(N/TILE), ceil(N/TILE), B*H)
+// Block: (TILE, TILE)
 
 // kernel 2 (Softmax):
-    // Grid: (B*H*N) --> one block per row
-    // Block: (min(N, 1024), ) --> or use multiple warps
+// Grid: (B*H*N) --> one block per row
+// Block: (min(N, 1024), ) --> or use multiple warps
 
 // kernel 3 (PV):
-    // Grid: (ceil(N/TILE), ceil(d/TILE), B*H)
-    // Block: (TILE, TILE)
+// Grid: (ceil(N/TILE), ceil(d/TILE), B*H)
+// Block: (TILE, TILE)
 
 // Output = softmax(Q @ K^T / sqrt(d)) @ V
 // Q, K, V: [B, H, N, d] - batch, heads, sequence length, head dimension

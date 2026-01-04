@@ -1,103 +1,106 @@
-#include <gtest/gtest.h>
 #include <cobraml2/kernels/fmha_cc.cuh>
-#include <thrust/host_vector.h>
+#include <gtest/gtest.h>
+#include <test_common/mha.cuh>
 #include <thrust/device_vector.h>
-#include <curand.h>
+#include <thrust/host_vector.h>
 
-
-using namespace cobraml::kernels;
+using namespace cobraml;
 using namespace cute;
 
-template<typename DType>
-void fill_zero(float * data, int length){
-    cudaMemset(data, 0, length * sizeof(DType));    
-    cudaDeviceSynchronize(); 
+template <int head_count, int head_dim, int B_r, int B_c>
+void test_fmha(int batch_size, int sequence_length) {
+  using MHAType = kernels::FMHA<head_count, head_dim, B_r, B_c, float>;
+
+  thrust::device_vector<float> q_device{test_helpers::create_projection<float>(
+      head_count, head_dim, batch_size, sequence_length,
+      test_helpers::seeded_fill_random_uniform<float>(0))};
+
+  thrust::device_vector<float> k_device{test_helpers::create_projection<float>(
+      head_count, head_dim, batch_size, sequence_length,
+      test_helpers::seeded_fill_random_uniform<float>(1))};
+
+  thrust::device_vector<float> v_device{test_helpers::create_projection<float>(
+      head_count, head_dim, batch_size, sequence_length,
+      test_helpers::seeded_fill_random_uniform<float>(2))};
+
+  thrust::device_vector<float> o_device{test_helpers::create_projection<float>(
+      head_count, head_dim, batch_size, sequence_length,
+      test_helpers::fill_zero<float>)};
+
+  MHAType mha{};
+
+#ifdef BENCHMARK
+  constexpr size_t warmup_iters{2};
+  constexpr size_t total_iters{10};
+#else
+  constexpr size_t warmup_iters{1};
+#endif
+
+  for (size_t i{0}; i < warmup_iters; ++i) {
+    mha(thrust::raw_pointer_cast(q_device.data()),
+        thrust::raw_pointer_cast(k_device.data()),
+        thrust::raw_pointer_cast(v_device.data()),
+        thrust::raw_pointer_cast(o_device.data()), batch_size, sequence_length);
+  }
+  cudaDeviceSynchronize();
+
+#ifdef BENCHMARK
+  float total_time_ms{0};
+  float ms;
+
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  for (size_t i{0}; i < total_iters; ++i) {
+    cudaEventRecord(start);
+    mha(thrust::raw_pointer_cast(q_device.data()),
+        thrust::raw_pointer_cast(k_device.data()),
+        thrust::raw_pointer_cast(v_device.data()),
+        thrust::raw_pointer_cast(o_device.data()), batch_size, sequence_length);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    total_time_ms += ms;
+  }
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+  cudaError_t err = cudaGetLastError();
+  ASSERT_EQ(err, cudaSuccess) << "CUDA error: " << cudaGetErrorString(err);
+
+  float average_time_ms{total_time_ms / total_iters};
+
+  // Calculate GFLOPs
+  std::cout << "Avg Kernel execution time: " << average_time_ms << " ms\n";
+  std::cout << "Achieved performance: "
+            << test_helpers::calculate_gflops(batch_size, head_count,
+                                              sequence_length, head_dim,
+                                              average_time_ms)
+            << " GFLOPs\n";
+#else
+  cudaError_t err = cudaGetLastError();
+  ASSERT_EQ(err, cudaSuccess) << "CUDA error: " << cudaGetErrorString(err);
+#endif
+
+  thrust::host_vector<float> q_host = q_device;
+  thrust::host_vector<float> k_host = k_device;
+  thrust::host_vector<float> v_host = v_device;
+  thrust::host_vector<float> o_host = o_device; // GPU output
+
+  // Compute CPU reference
+  std::vector<float> o_ref(o_host.size(), 0.0f);
+
+  test_helpers::cpu_mha(q_host.data(), k_host.data(), v_host.data(),
+                        o_ref.data(), batch_size, head_count, sequence_length,
+                        head_dim);
+
+  std::vector<float> o_vec(o_host.begin(), o_host.end());
+  test_helpers::check_output(o_vec, o_ref, batch_size, head_count,
+                             sequence_length, head_dim, 1e-4f);
 }
 
-void fill_projection_random_uniform(float * data, int length, int seed){
-    curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, seed);
-    curandGenerateUniform(gen, data, length);
-    curandDestroyGenerator(gen);
-    cudaDeviceSynchronize(); 
-}
-
-template<typename DType>
-thrust::device_vector<DType> create_projection(
-    int head_count, 
-    int head_dim, 
-    int batch_size, 
-    int sequence_length,
-    auto fill_fn
-){
-    int total_length{head_count * head_dim * batch_size * sequence_length};
-    thrust::device_vector<DType> device_vec(total_length);
-    fill_fn(thrust::raw_pointer_cast(device_vec.data()), total_length);
-
-    return device_vec;
-}
-
-auto seeded_fill_fn(int seed) {
-    return [=](float * data, int length){
-        fill_projection_random_uniform(data, length, seed);
-    };
-}
-
-TEST(MHA_TEST, kernel) {
-
-    constexpr int head_count{16};
-    constexpr int head_dim{64};
-    constexpr int B_r{64};
-    constexpr int B_c{64};
-
-    int batch_size{56};
-    int sequence_length{128};
-
-    using MHAType = FMHA<head_count, head_dim, B_r, B_c, float>;
-
-    thrust::device_vector<float> q_device{
-        create_projection<float>(
-            head_count, head_dim, batch_size, sequence_length,
-            seeded_fill_fn(0)
-        )
-    };
-
-    thrust::device_vector<float> k_device{
-        create_projection<float>(
-            head_count, head_dim, batch_size, sequence_length,
-            seeded_fill_fn(1)
-        )
-    };
-
-    thrust::device_vector<float> v_device{
-        create_projection<float>(
-            head_count, head_dim, batch_size, sequence_length,
-            seeded_fill_fn(2)
-        )
-    };
-
-    auto fill_zero_ptr{fill_zero<float>};
-
-    thrust::device_vector<float> o_device{
-        create_projection<float>(
-            head_count, head_dim, batch_size, sequence_length,
-            fill_zero_ptr
-        )
-    };
-
-    MHAType mha{};
-
-    mha(
-        thrust::raw_pointer_cast(q_device.data()), 
-        thrust::raw_pointer_cast(k_device.data()), 
-        thrust::raw_pointer_cast(v_device.data()), 
-        thrust::raw_pointer_cast(o_device.data()), 
-        batch_size, 
-        sequence_length
-    );
-
-    cudaDeviceSynchronize();
-    cudaError_t err = cudaGetLastError();
-    ASSERT_EQ(err, cudaSuccess) << cudaGetErrorString(err);
+TEST(FMHA_CC, H16_D64_Br64_Bc64_B56_N128) {
+  test_fmha<16, 64, 64, 64>(56, 128);
 }

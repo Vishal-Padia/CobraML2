@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+cmake_minimum_required(VERSION 3.24)
 # set(CMAKE_CXX_STANDARD 20)
 # set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -13,6 +13,11 @@ endif()
 project(cobraml2 VERSION 0.0.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -std=c++20")
+
+option(BENCHMARK "Enable benchmarking" OFF)
+if(BENCHMARK)
+    add_compile_definitions(BENCHMARK)
+endif()
 
 # Performance boost
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math")
