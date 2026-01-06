@@ -38,8 +38,8 @@ void test_mha(int batch_size, int sequence_length) {
         thrust::raw_pointer_cast(k_device.data()),
         thrust::raw_pointer_cast(v_device.data()),
         thrust::raw_pointer_cast(o_device.data()),
-        batch_size,      // B
-        sequence_length  // N
+        batch_size,     // B
+        sequence_length // N
     );
   }
 
@@ -61,8 +61,8 @@ void test_mha(int batch_size, int sequence_length) {
         thrust::raw_pointer_cast(k_device.data()),
         thrust::raw_pointer_cast(v_device.data()),
         thrust::raw_pointer_cast(o_device.data()),
-        batch_size,      // B
-        sequence_length  // N
+        batch_size,     // B
+        sequence_length // N
     );
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);

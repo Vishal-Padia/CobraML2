@@ -38,8 +38,8 @@ CUTE_HOST_DEVICE auto make_gemm_tiled_mma() {
 }
 
 namespace mha_cute {
-template <int TILE_N, int HEAD_DIM, int NUM_HEADS, typename DType, typename TiledCopyQ,
-          typename TiledCopyK, typename TiledMMA>
+template <int TILE_N, int HEAD_DIM, int NUM_HEADS, typename DType,
+          typename TiledCopyQ, typename TiledCopyK, typename TiledMMA>
 __global__ void qk_kernel(const DType *__restrict__ Q, // [B, H, N, d]
                           const DType *__restrict__ K, // [B, H, N, d]
                           DType *__restrict__ S,       // [B, H, N, N]
@@ -48,12 +48,15 @@ __global__ void qk_kernel(const DType *__restrict__ Q, // [B, H, N, d]
   // Create global memory tensor
   auto Q_tensor = make_tensor(
       make_gmem_ptr(Q),
-      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}),
+                  LayoutRight{}));
   auto K_tensor = make_tensor(
       make_gmem_ptr(K),
-      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}),
+                  LayoutRight{}));
   auto S_tensor = make_tensor(
-      make_gmem_ptr(S), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, N), LayoutRight{}));
+      make_gmem_ptr(S),
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, N), LayoutRight{}));
 
   // Decode batch and head indices from blockIdx.z
   int bh = blockIdx.z;
@@ -71,10 +74,12 @@ __global__ void qk_kernel(const DType *__restrict__ Q, // [B, H, N, d]
   // extract gQ for this row
   auto gQ = local_tile(Q_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
                        make_coord(tile_row, 0));
-  
+
   // shared memory layouts
-  auto sQ_layout = make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
-  auto sK_layout = make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
+  auto sQ_layout =
+      make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
+  auto sK_layout =
+      make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
 
   __shared__ DType smem_q[cosize_v<decltype(sQ_layout)>];
   __shared__ DType smem_k[cosize_v<decltype(sK_layout)>];
@@ -96,7 +101,7 @@ __global__ void qk_kernel(const DType *__restrict__ Q, // [B, H, N, d]
   // load Q once outside loop
   copy(tiled_copy_q, tQgQ, tQsQ);
   __syncthreads();
-  
+
   // number of k tiles to iterate over
   int num_k_tiles = N / TILE_N;
 
@@ -206,8 +211,8 @@ __global__ void softmax_kernel(DType *__restrict__ S, // [B, H, N, N]
   }
 }
 
-template <int TILE_N, int HEAD_DIM, int NUM_HEADS, typename DType, typename TiledCopyP,
-          typename TiledCopyV, typename TiledMMA>
+template <int TILE_N, int HEAD_DIM, int NUM_HEADS, typename DType,
+          typename TiledCopyP, typename TiledCopyV, typename TiledMMA>
 __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
                           const DType *__restrict__ V, // [B, H, N, d]
                           DType *__restrict__ O,       // [B, H, N, d]
@@ -215,11 +220,16 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
                           TiledCopyV tiled_copy_v, TiledMMA tiled_mma) {
   // create global memory tensor views
   auto P_tensor = make_tensor(
-      make_gmem_ptr(P), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, N), LayoutRight{}));
+      make_gmem_ptr(P),
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, N), LayoutRight{}));
   auto V_tensor = make_tensor(
-      make_gmem_ptr(V), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
+      make_gmem_ptr(V),
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}),
+                  LayoutRight{}));
   auto O_tensor = make_tensor(
-      make_gmem_ptr(O), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
+      make_gmem_ptr(O),
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}),
+                  LayoutRight{}));
 
   // decode batch and head indices
   int bh = blockIdx.z;
@@ -271,7 +281,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
     auto gP = local_tile(P_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
                          make_coord(tile_row, j_tile));
 
-    // get V tile: [TILE_N, TILE_N]
+    // get V tile: [TILE_N, HEAD_DIM]
     auto gV = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
                          make_coord(j_tile, tile_col));
 
@@ -302,10 +312,11 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
 }
 } // namespace mha_cute
 
-template <int TILE_N = 16, int HEAD_DIM = 64, int NUM_HEADS = 8, 
+template <int TILE_N = 16, int HEAD_DIM = 64, int NUM_HEADS = 8,
           int SOFTMAX_BLOCK = 256, typename DType = float>
 void mha_forward(DType *Q, DType *K, DType *V, DType *O, int B, int N) {
-  // allocate intermediate buffer (S will hold scores, then probabilities after softmax)
+  // allocate intermediate buffer (S will hold scores, then probabilities after
+  // softmax)
   DType *S;
   cudaMalloc(&S, B * NUM_HEADS * N * N * sizeof(DType));
 
@@ -319,8 +330,8 @@ void mha_forward(DType *Q, DType *K, DType *V, DType *O, int B, int N) {
     dim3 grid(1, (N + TILE_N - 1) / TILE_N, B * NUM_HEADS);
     dim3 block(num_threads);
 
-    mha_cute::qk_kernel<TILE_N, HEAD_DIM, NUM_HEADS, DType><<<grid, block>>>(
-        Q, K, S, B, N, tiled_copy_q, tiled_copy_k, tiled_mma);
+    mha_cute::qk_kernel<TILE_N, HEAD_DIM, NUM_HEADS, DType>
+        <<<grid, block>>>(Q, K, S, B, N, tiled_copy_q, tiled_copy_k, tiled_mma);
   }
 
   {
@@ -336,12 +347,13 @@ void mha_forward(DType *Q, DType *K, DType *V, DType *O, int B, int N) {
 
     constexpr int num_threads = TILE_N * TILE_N;
 
-    dim3 grid((HEAD_DIM + TILE_N - 1) / TILE_N, (N + TILE_N - 1) / TILE_N, B * NUM_HEADS);
+    dim3 grid((HEAD_DIM + TILE_N - 1) / TILE_N, (N + TILE_N - 1) / TILE_N,
+              B * NUM_HEADS);
     dim3 block(num_threads);
 
     // Use S directly - it now contains softmax probabilities
-    mha_cute::pv_kernel<TILE_N, HEAD_DIM, NUM_HEADS, DType><<<grid, block>>>(
-        S, V, O, B, N, tiled_copy_p, tiled_copy_v, tiled_mma);
+    mha_cute::pv_kernel<TILE_N, HEAD_DIM, NUM_HEADS, DType>
+        <<<grid, block>>>(S, V, O, B, N, tiled_copy_p, tiled_copy_v, tiled_mma);
   }
 
   cudaDeviceSynchronize();
