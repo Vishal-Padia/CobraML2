@@ -24,7 +24,7 @@ namespace cobraml::kernels {
 using namespace cute;
 
 // helper functions
-template <int TILE_ROW, int TILE_COL, typename DType>
+template <int TILE_ROW, typename DType>
 CUTE_HOST_DEVICE auto make_gemm_tiled_copy() {
   return make_tiled_copy(
       Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, DType>{},
@@ -38,103 +38,108 @@ CUTE_HOST_DEVICE auto make_gemm_tiled_mma() {
 }
 
 namespace mha_cute {
-template <int TILE_N, int HEAD_DIM, typename DType, typename TiledCopyQ,
+template <int TILE_N, int HEAD_DIM, int NUM_HEADS, typename DType, typename TiledCopyQ,
           typename TiledCopyK, typename TiledMMA>
 __global__ void qk_kernel(const DType *__restrict__ Q, // [B, H, N, d]
                           const DType *__restrict__ K, // [B, H, N, d]
                           DType *__restrict__ S,       // [B, H, N, N]
-                          int B, int H, int N, TiledCopyQ tiled_copy_q,
+                          int B, int N, TiledCopyQ tiled_copy_q,
                           TiledCopyK tiled_copy_k, TiledMMA tiled_mma) {
   // Create global memory tensor
   auto Q_tensor = make_tensor(
       make_gmem_ptr(Q),
-      make_layout(make_shape(B, H, N, Int<HEAD_DIM>{}), LayoutRight{}));
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
   auto K_tensor = make_tensor(
       make_gmem_ptr(K),
-      make_layout(make_shape(B, H, N, Int<HEAD_DIM>{}), LayoutRight{}));
+      make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
   auto S_tensor = make_tensor(
-      make_gmem_ptr(S), make_layout(make_shape(B, H, N, N), LayoutRight{}));
+      make_gmem_ptr(S), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, N), LayoutRight{}));
 
   // Decode batch and head indices from blockIdx.z
   int bh = blockIdx.z;
-  int b_idx = bh / H;
-  int h_idx = bh % H;
+  int b_idx = bh / NUM_HEADS;
+  int h_idx = bh % NUM_HEADS;
 
   // Slice tensors to current batch and head
   auto Q_bh = Q_tensor(b_idx, h_idx, _, _); // [N, HEAD_DIM]
   auto K_bh = K_tensor(b_idx, h_idx, _, _); // [N, HEAD_DIM]
   auto S_bh = S_tensor(b_idx, h_idx, _, _); // [N, N]
 
-  // cta tile coordinates
+  // each cta handles one of S tiles (tile_row is fixed),
   int tile_row = blockIdx.y;
-  int tile_col = blockIdx.x;
 
-  // extract this CTA's tiles
+  // extract gQ for this row
   auto gQ = local_tile(Q_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
                        make_coord(tile_row, 0));
-
-  auto gK = local_tile(K_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
-                       make_coord(tile_col, 0));
-
-  auto gS = local_tile(S_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
-                       make_coord(tile_row, tile_col));
-
+  
   // shared memory layouts
-  auto sQ_layout =
-      make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
-  auto sK_layout =
-      make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
+  auto sQ_layout = make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
+  auto sK_layout = make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
 
   __shared__ DType smem_q[cosize_v<decltype(sQ_layout)>];
   __shared__ DType smem_k[cosize_v<decltype(sK_layout)>];
 
-  // create shared memory tensor views
   Tensor sQ = make_tensor(make_smem_ptr(smem_q), sQ_layout);
   Tensor sK = make_tensor(make_smem_ptr(smem_k), sK_layout);
 
-  // thread partitioning for copy operations
   auto thr_copy_q = tiled_copy_q.get_slice(threadIdx.x);
   auto thr_copy_k = tiled_copy_k.get_slice(threadIdx.x);
 
-  // partition source (global) and destination (shared) tensors
+  // partition Q for copy
   Tensor tQgQ = thr_copy_q.partition_S(gQ);
   Tensor tQsQ = thr_copy_q.partition_D(sQ);
-  Tensor tKgK = thr_copy_k.partition_S(gK);
-  Tensor tKsK = thr_copy_k.partition_D(sK);
 
-  // thread partitioning for mma operations
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
-
-  // partition shared memory for mma consumption
   Tensor tCsQ = thr_mma.partition_A(sQ);
   Tensor tCsK = thr_mma.partition_B(sK);
-  Tensor tCgS = thr_mma.partition_C(gS);
 
-  // allocate and clear accumulator fragment
-  Tensor tCrS = thr_mma.make_fragment_C(tCgS);
-  clear(tCrS);
-
-  // load Q and K tiles to shared memory
+  // load Q once outside loop
   copy(tiled_copy_q, tQgQ, tQsQ);
-  copy(tiled_copy_k, tKgK, tKsK);
   __syncthreads();
+  
+  // number of k tiles to iterate over
+  int num_k_tiles = N / TILE_N;
 
-  // compute gemm: S = Q @ K^T
-  gemm(tiled_mma, tCsQ, tCsK, tCrS);
-
-  // apply scaling factor 1/sqrt(d) and write to global memory
   DType scale = DType(1.0) / sqrt(DType(HEAD_DIM));
-  CUTE_UNROLL
-  for (int i = 0; i < size(tCrS); ++i) {
-    tCrS(i) *= scale;
-  }
 
-  copy(tCrS, tCgS);
+  for (int tile_col = 0; tile_col < num_k_tiles; ++tile_col) {
+    // Get K tile for this iteration
+    auto gK = local_tile(K_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
+                         make_coord(tile_col, 0));
+
+    // Get S tile for output
+    auto gS = local_tile(S_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
+                         make_coord(tile_row, tile_col));
+
+    // Partition K for copy
+    Tensor tKgK = thr_copy_k.partition_S(gK);
+    Tensor tKsK = thr_copy_k.partition_D(sK);
+
+    // Load K tile (streamed each iteration)
+    copy(tiled_copy_k, tKgK, tKsK);
+    __syncthreads();
+
+    // Partition S for output
+    Tensor tCgS = thr_mma.partition_C(gS);
+    Tensor tCrS = thr_mma.make_fragment_C(tCgS);
+    clear(tCrS);
+
+    // Compute GEMM: S_tile = Q_tile @ K_tile^T
+    gemm(tiled_mma, tCsQ, tCsK, tCrS);
+
+    // Apply scaling and write
+    CUTE_UNROLL
+    for (int i = 0; i < size(tCrS); ++i) {
+      tCrS(i) *= scale;
+    }
+
+    copy(tCrS, tCgS);
+    __syncthreads();
+  }
 }
 
 template <int BLOCK_SIZE, typename DType>
-__global__ void softmax_kernel(const DType *__restrict__ S, // [B, H, N, N]
-                               DType *__restrict__ P,       // [B, H, N, N]
+__global__ void softmax_kernel(DType *__restrict__ S, // [B, H, N, N]
                                int B, int H, int N) {
   // each block handles one row
   int row_idx = blockIdx.x;
@@ -151,12 +156,9 @@ __global__ void softmax_kernel(const DType *__restrict__ S, // [B, H, N, N]
   // create tensor views
   auto S_tensor = make_tensor(
       make_gmem_ptr(S), make_layout(make_shape(B, H, N, N), LayoutRight{}));
-  auto P_tensor = make_tensor(
-      make_gmem_ptr(P), make_layout(make_shape(B, H, N, N), LayoutRight{}));
 
   // get this row
   auto S_row = S_tensor(b, h, i, _);
-  auto P_row = P_tensor(b, h, i, _);
 
   // shared memory for parallel reduction
   __shared__ DType smax[BLOCK_SIZE];
@@ -200,29 +202,29 @@ __global__ void softmax_kernel(const DType *__restrict__ S, // [B, H, N, N]
 
   // write normalized softmax values
   for (int j = tid; j < N; j += BLOCK_SIZE) {
-    P_row(j) = expf(S_row(j) - row_max) / row_sum;
+    S_row(j) = expf(S_row(j) - row_max) / row_sum;
   }
 }
 
-template <int TILE_N, int TILE_D, typename DType, typename TiledCopyP,
+template <int TILE_N, int HEAD_DIM, int NUM_HEADS, typename DType, typename TiledCopyP,
           typename TiledCopyV, typename TiledMMA>
 __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
                           const DType *__restrict__ V, // [B, H, N, d]
                           DType *__restrict__ O,       // [B, H, N, d]
-                          int B, int H, int N, int d, TiledCopyP tiled_copy_p,
+                          int B, int N, TiledCopyP tiled_copy_p,
                           TiledCopyV tiled_copy_v, TiledMMA tiled_mma) {
   // create global memory tensor views
   auto P_tensor = make_tensor(
-      make_gmem_ptr(P), make_layout(make_shape(B, H, N, N), LayoutRight{}));
+      make_gmem_ptr(P), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, N), LayoutRight{}));
   auto V_tensor = make_tensor(
-      make_gmem_ptr(V), make_layout(make_shape(B, H, N, d), LayoutRight{}));
+      make_gmem_ptr(V), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
   auto O_tensor = make_tensor(
-      make_gmem_ptr(O), make_layout(make_shape(B, H, N, d), LayoutRight{}));
+      make_gmem_ptr(O), make_layout(make_shape(B, Int<NUM_HEADS>{}, N, Int<HEAD_DIM>{}), LayoutRight{}));
 
   // decode batch and head indices
   int bh = blockIdx.z;
-  int b_idx = bh / H;
-  int h_idx = bh % H;
+  int b_idx = bh / NUM_HEADS;
+  int h_idx = bh % NUM_HEADS;
 
   // slice to current batch and head
   auto P_bh = P_tensor(b_idx, h_idx, _, _); // [N, N]
@@ -237,7 +239,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   auto sP_layout =
       make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), LayoutRight{});
   auto sV_layout =
-      make_layout(make_shape(Int<TILE_N>{}, Int<TILE_D>{}), LayoutRight{});
+      make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), LayoutRight{});
 
   __shared__ DType smem_p[cosize_v<decltype(sP_layout)>];
   __shared__ DType smem_v[cosize_v<decltype(sV_layout)>];
@@ -246,17 +248,17 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   Tensor sV = make_tensor(make_smem_ptr(smem_v), sV_layout);
 
   // thread partitioning for copy
-  ThrCopy thr_copy_p = tiled_copy_p.get_slice(threadIdx.x);
-  ThrCopy thr_copy_v = tiled_copy_v.get_slice(threadIdx.x);
+  auto thr_copy_p = tiled_copy_p.get_slice(threadIdx.x);
+  auto thr_copy_v = tiled_copy_v.get_slice(threadIdx.x);
 
   // thread partitioning for mma
-  ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
+  auto thr_mma = tiled_mma.get_slice(threadIdx.x);
 
   // number of tiles along the reduction dimension
-  int num_j_tiles = (N + TILE_N - 1) / TILE_N;
+  int num_j_tiles = N / TILE_N;
 
   // get output tile and allocate accumulator
-  auto gO = local_tile(O_bh, make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
+  auto gO = local_tile(O_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
                        make_coord(tile_row, tile_col));
 
   Tensor tCgO = thr_mma.partition_C(gO);
@@ -269,8 +271,8 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
     auto gP = local_tile(P_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
                          make_coord(tile_row, j_tile));
 
-    // get V tile: [TILE_N, TILE_D]
-    auto gV = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<TILE_D>{}),
+    // get V tile: [TILE_N, TILE_N]
+    auto gV = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
                          make_coord(j_tile, tile_col));
 
     // Partition for copy
@@ -300,52 +302,49 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
 }
 } // namespace mha_cute
 
-template <int TILE_N = 16, int TILE_D = 16, int SOFTMAX_BLOCK = 256,
-          typename DType = float>
-void mha_forward(DType *Q, DType *K, DType *V, DType *O, int B, int H, int N,
-                 int d) {
-  // allocate intermediate buffers
-  DType *S, *P;
-  cudaMalloc(&S, B * H * N * N * sizeof(DType));
-  cudaMalloc(&P, B * H * N * N * sizeof(DType));
+template <int TILE_N = 16, int HEAD_DIM = 64, int NUM_HEADS = 8, 
+          int SOFTMAX_BLOCK = 256, typename DType = float>
+void mha_forward(DType *Q, DType *K, DType *V, DType *O, int B, int N) {
+  // allocate intermediate buffer (S will hold scores, then probabilities after softmax)
+  DType *S;
+  cudaMalloc(&S, B * NUM_HEADS * N * N * sizeof(DType));
 
   {
-    auto tiled_copy_q = make_gemm_tiled_copy<TILE_N, TILE_D, DType>();
-    auto tiled_copy_k = make_gemm_tiled_copy<TILE_N, TILE_D, DType>();
+    auto tiled_copy_q = make_gemm_tiled_copy<TILE_N, DType>();
+    auto tiled_copy_k = make_gemm_tiled_copy<TILE_N, DType>();
     auto tiled_mma = make_gemm_tiled_mma<TILE_N, TILE_N, DType>();
 
     constexpr int num_threads = TILE_N * TILE_N;
 
-    dim3 grid((N + TILE_N - 1) / TILE_N, (N + TILE_N - 1) / TILE_N, B * H);
+    dim3 grid(1, (N + TILE_N - 1) / TILE_N, B * NUM_HEADS);
     dim3 block(num_threads);
 
-    mha_cute::qk_kernel<TILE_N, TILE_D, DType><<<grid, block>>>(
-        Q, K, S, B, H, N, tiled_copy_q, tiled_copy_k, tiled_mma);
+    mha_cute::qk_kernel<TILE_N, HEAD_DIM, NUM_HEADS, DType><<<grid, block>>>(
+        Q, K, S, B, N, tiled_copy_q, tiled_copy_k, tiled_mma);
   }
 
   {
-    int total_rows = B * H * N;
+    int total_rows = B * NUM_HEADS * N;
     mha_cute::softmax_kernel<SOFTMAX_BLOCK, DType>
-        <<<total_rows, SOFTMAX_BLOCK>>>(S, P, B, H, N);
+        <<<total_rows, SOFTMAX_BLOCK>>>(S, B, NUM_HEADS, N);
   }
 
   {
-    auto tiled_copy_p = make_gemm_tiled_copy<TILE_N, TILE_N, DType>();
-    auto tiled_copy_v = make_gemm_tiled_copy<TILE_N, TILE_D, DType>();
-    auto tiled_mma = make_gemm_tiled_mma<TILE_N, TILE_D, DType>();
+    auto tiled_copy_p = make_gemm_tiled_copy<TILE_N, DType>();
+    auto tiled_copy_v = make_gemm_tiled_copy<TILE_N, DType>();
+    auto tiled_mma = make_gemm_tiled_mma<TILE_N, TILE_N, DType>();
 
-    constexpr int num_threads = TILE_N * TILE_D;
+    constexpr int num_threads = TILE_N * TILE_N;
 
-    dim3 grid((d + TILE_D - 1) / TILE_D, (N + TILE_N - 1) / TILE_N, B * H);
+    dim3 grid((HEAD_DIM + TILE_N - 1) / TILE_N, (N + TILE_N - 1) / TILE_N, B * NUM_HEADS);
     dim3 block(num_threads);
 
-    mha_cute::pv_kernel<TILE_N, TILE_D, DType><<<grid, block>>>(
-        P, V, O, B, H, N, d, tiled_copy_p, tiled_copy_v, tiled_mma);
+    // Use S directly - it now contains softmax probabilities
+    mha_cute::pv_kernel<TILE_N, HEAD_DIM, NUM_HEADS, DType><<<grid, block>>>(
+        S, V, O, B, N, tiled_copy_p, tiled_copy_v, tiled_mma);
   }
 
   cudaDeviceSynchronize();
   cudaFree(S);
-  cudaFree(P);
 }
-
 } // namespace cobraml::kernels

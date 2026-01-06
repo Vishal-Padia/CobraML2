@@ -33,14 +33,13 @@ void test_mha(int batch_size, int sequence_length) {
 #endif
 
   for (size_t i{0}; i < warmup_iters; ++i) {
-    kernels::mha_forward(thrust::raw_pointer_cast(q_device.data()),
-                         thrust::raw_pointer_cast(k_device.data()),
-                         thrust::raw_pointer_cast(v_device.data()),
-                         thrust::raw_pointer_cast(o_device.data()),
-                         batch_size,      // B
-                         head_count,      // H
-                         sequence_length, // N
-                         head_dim         // d
+    kernels::mha_forward<16, head_dim, head_count>(
+        thrust::raw_pointer_cast(q_device.data()),
+        thrust::raw_pointer_cast(k_device.data()),
+        thrust::raw_pointer_cast(v_device.data()),
+        thrust::raw_pointer_cast(o_device.data()),
+        batch_size,      // B
+        sequence_length  // N
     );
   }
 
@@ -57,14 +56,13 @@ void test_mha(int batch_size, int sequence_length) {
 
   for (size_t i{0}; i < total_iters; ++i) {
     cudaEventRecord(start);
-    kernels::mha_forward(thrust::raw_pointer_cast(q_device.data()),
-                         thrust::raw_pointer_cast(k_device.data()),
-                         thrust::raw_pointer_cast(v_device.data()),
-                         thrust::raw_pointer_cast(o_device.data()),
-                         batch_size,      // B
-                         head_count,      // H
-                         sequence_length, // N
-                         head_dim         // d
+    kernels::mha_forward<16, head_dim, head_count>(
+        thrust::raw_pointer_cast(q_device.data()),
+        thrust::raw_pointer_cast(k_device.data()),
+        thrust::raw_pointer_cast(v_device.data()),
+        thrust::raw_pointer_cast(o_device.data()),
+        batch_size,      // B
+        sequence_length  // N
     );
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
