@@ -239,7 +239,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   auto sP_layout =
       make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), LayoutRight{});
   auto sV_layout =
-      make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), LayoutRight{});
+      make_layout(make_shape(Int<HEAD_DIM>{}, Int<TILE_N>{}), LayoutRight{});
 
   __shared__ DType smem_p[cosize_v<decltype(sP_layout)>];
   __shared__ DType smem_v[cosize_v<decltype(sV_layout)>];
@@ -258,7 +258,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   int num_j_tiles = N / TILE_N;
 
   // get output tile and allocate accumulator
-  auto gO = local_tile(O_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
+  auto gO = local_tile(O_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
                        make_coord(tile_row, tile_col));
 
   Tensor tCgO = thr_mma.partition_C(gO);
@@ -272,7 +272,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
                          make_coord(tile_row, j_tile));
 
     // get V tile: [TILE_N, TILE_N]
-    auto gV = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
+    auto gV = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
                          make_coord(j_tile, tile_col));
 
     // Partition for copy
