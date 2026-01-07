@@ -276,7 +276,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   // Each thread will accumulate its portion of the output
   int tid = threadIdx.x;
   int num_threads = blockDim.x;
-  
+
   // Zero out output tile
   for (int i = tid; i < TILE_N * HEAD_DIM; i += num_threads) {
     int row = i / HEAD_DIM;
@@ -315,7 +315,7 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
     for (int idx = tid; idx < TILE_N * HEAD_DIM; idx += num_threads) {
       int i = idx / HEAD_DIM;
       int d = idx % HEAD_DIM;
-      
+
       DType sum = DType(0);
       for (int j = 0; j < TILE_N; ++j) {
         sum += sP(i, j) * sV(j, d);
