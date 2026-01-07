@@ -236,20 +236,23 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   int b_idx = bh / NUM_HEADS;
   int h_idx = bh % NUM_HEADS;
 
-  // slice to current batch and head
+  // Slice tensors to current batch and head
   auto P_bh = P_tensor(b_idx, h_idx, _, _); // [N, N]
-  auto V_bh = V_tensor(b_idx, h_idx, _, _); // [N, d]
-  auto O_bh = O_tensor(b_idx, h_idx, _, _); // [N, d]
+  auto V_bh = V_tensor(b_idx, h_idx, _, _); // [N, HEAD_DIM]
+  auto O_bh = O_tensor(b_idx, h_idx, _, _); // [N, HEAD_DIM]
 
-  // cta tile coordinates
+  // Each CTA handles one row tile of O
   int tile_row = blockIdx.y;
-  int tile_col = blockIdx.x;
 
-  // shared memory layouts
+  // Extract P row tile for this CTA - load once
+  auto gP = local_tile(P_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
+                       make_coord(tile_row, 0));
+
+  // Shared memory layouts
   auto sP_layout =
       make_layout(make_shape(Int<TILE_N>{}, Int<TILE_N>{}), LayoutRight{});
   auto sV_layout =
-      make_layout(make_shape(Int<HEAD_DIM>{}, Int<TILE_N>{}), LayoutRight{});
+      make_layout(make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}), LayoutRight{});
 
   __shared__ DType smem_p[cosize_v<decltype(sP_layout)>];
   __shared__ DType smem_v[cosize_v<decltype(sV_layout)>];
@@ -257,37 +260,47 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
   Tensor sP = make_tensor(make_smem_ptr(smem_p), sP_layout);
   Tensor sV = make_tensor(make_smem_ptr(smem_v), sV_layout);
 
-  // thread partitioning for copy
   auto thr_copy_p = tiled_copy_p.get_slice(threadIdx.x);
   auto thr_copy_v = tiled_copy_v.get_slice(threadIdx.x);
 
-  // thread partitioning for mma
-  auto thr_mma = tiled_mma.get_slice(threadIdx.x);
-
-  // number of tiles along the reduction dimension
-  int num_j_tiles = N / TILE_N;
-
-  // get output tile and allocate accumulator
+  // Get output tile for this row
   auto gO = local_tile(O_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
-                       make_coord(tile_row, tile_col));
+                       make_coord(tile_row, 0));
 
-  Tensor tCgO = thr_mma.partition_C(gO);
-  Tensor tCrO = thr_mma.make_fragment_C(tCgO);
-  clear(tCrO);
+  // Clear output in global memory first
+  auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+  Tensor tCsP = thr_mma.partition_A(sP);
+  Tensor tCsV = thr_mma.partition_B(sV);
 
-  // accumulation loop over N dimension
-  for (int j_tile = 0; j_tile < num_j_tiles; ++j_tile) {
-    // get P tile: [TILE_N, TILE_N]
-    auto gP = local_tile(P_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
-                         make_coord(tile_row, j_tile));
+  // Use simple element-wise accumulation
+  // Each thread will accumulate its portion of the output
+  int tid = threadIdx.x;
+  int num_threads = blockDim.x;
+  
+  // Zero out output tile
+  for (int i = tid; i < TILE_N * HEAD_DIM; i += num_threads) {
+    int row = i / HEAD_DIM;
+    int col = i % HEAD_DIM;
+    gO(row, col) = DType(0);
+  }
+  __syncthreads();
 
-    // get V tile: [TILE_N, HEAD_DIM]
-    auto gV = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
-                         make_coord(j_tile, tile_col));
+  // Number of tiles along the reduction dimension
+  int num_k_tiles = N / TILE_N;
+
+  // Accumulation loop over N dimension
+  for (int k_tile = 0; k_tile < num_k_tiles; ++k_tile) {
+    // Get P tile: [TILE_N, TILE_N]
+    auto gP_tile = local_tile(P_bh, make_shape(Int<TILE_N>{}, Int<TILE_N>{}),
+                              make_coord(tile_row, k_tile));
+
+    // Get V tile: [TILE_N, HEAD_DIM]
+    auto gV_tile = local_tile(V_bh, make_shape(Int<TILE_N>{}, Int<HEAD_DIM>{}),
+                              make_coord(k_tile, 0));
 
     // Partition for copy
-    Tensor tPgP = thr_copy_p.partition_S(gP);
-    Tensor tVgV = thr_copy_v.partition_S(gV);
+    Tensor tPgP = thr_copy_p.partition_S(gP_tile);
+    Tensor tVgV = thr_copy_v.partition_S(gV_tile);
 
     Tensor tPsP = thr_copy_p.partition_D(sP);
     Tensor tVsV = thr_copy_v.partition_D(sV);
@@ -298,17 +311,20 @@ __global__ void pv_kernel(const DType *__restrict__ P, // [B, H, N, N]
 
     __syncthreads();
 
-    // Partition shared memory for MMA
-    Tensor tCsP = thr_mma.partition_A(sP);
-    Tensor tCsV = thr_mma.partition_B(sV);
-
-    // Compute P @ V and accumulate
-    gemm(tiled_mma, tCsP, tCsV, tCrO);
+    // manual gemm
+    for (int idx = tid; idx < TILE_N * HEAD_DIM; idx += num_threads) {
+      int i = idx / HEAD_DIM;
+      int d = idx % HEAD_DIM;
+      
+      DType sum = DType(0);
+      for (int j = 0; j < TILE_N; ++j) {
+        sum += sP(i, j) * sV(j, d);
+      }
+      gO(i, d) += sum;
+    }
 
     __syncthreads();
   }
-
-  copy(tCrO, tCgO);
 }
 } // namespace mha_cute
 
@@ -347,8 +363,7 @@ void mha_forward(DType *Q, DType *K, DType *V, DType *O, int B, int N) {
 
     constexpr int num_threads = TILE_N * TILE_N;
 
-    dim3 grid((HEAD_DIM + TILE_N - 1) / TILE_N, (N + TILE_N - 1) / TILE_N,
-              B * NUM_HEADS);
+    dim3 grid(1, (N + TILE_N - 1) / TILE_N, B * NUM_HEADS);
     dim3 block(num_threads);
 
     // Use S directly - it now contains softmax probabilities
